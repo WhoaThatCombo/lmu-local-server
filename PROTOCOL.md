@@ -163,6 +163,55 @@ node, then `0xf9`. The client logs `Changing session from Practice1 to Qualify` 
 1-4 practice, 5-8 qualifying, 9 warmup, 10-13 race. The client keeps its own results file
 per session (`[Results] Post`); the server does not collect results yet.
 
+### Race state (`0x174` "Other::RaceState2")
+
+The server sends this every few seconds and on every phase change; the client applies it in
+`ProcessRaceStateEvent2()` (`steward.cpp`). Body:
+
+| Offset | Type | Meaning |
+|--------|------|---------|
+| 0 | u8 | game phase (low nibble: 0 before, 3 formation, 4 start lights, 5 green, 6 full-course yellow, 8 over) and yellow-flag state (high nibble) |
+| 1, 5 | f32 | session start time (ET seconds; the green-flag time in a race) |
+| 9 | f32 | session end time (length = end - start) |
+| 13, 17, 21 | f32 | other times; the game resets them to `FLT_MAX` ("none") |
+| 25 + 3n | u16, i8 | per car: `slot << 8 | finish << 6 | 2 small fields`, then qualifying position |
+
+Finish status: 0 racing, 1 finished, 2 DNF, 3 DQ. **Without this event every car counts as
+finished** (`GetGameState.raceFinished` is true) and Drive stays disabled. `0x145` is the same
+event with 2 bytes per car (no qualifying position). The server keeps practice and qualifying
+green from the start; a race waits 30 s before the start, runs 5 s of start lights, then goes
+green.
+
+### What the Drive button needs
+
+The UI enables Drive when `GET /rest/race/getAllowedToStartRacing` (`FUN_140bdf8a0`) is true:
+
+1. Some car has finish status 0 (race state above).
+2. The player's own info (`02`, kept locally) has its slot at byte 0x24. The client writes it
+   when it handles SlotAssignment *after* its car has loaded; a single assignment sent straight
+   back with the VehicleResponse is often too early, so the server re-sends SlotAssignment until
+   an `02` with the slot arrives.
+3. The player's car is found in the game's car list and the car, its livery and the track are
+   owned on Steam (content types 0, 1, 2). **A car from DLC the player does not own can never
+   drive.** Joining by REST skips the game's multiplayer car screen (which only allows owned
+   cars), so the toolkit picks the car itself with `POST /rest/garage/SetCurrentVehicle`
+   `{"id": ...}` after `JOIN_JOINED_SERVER`, using ids from
+   `POST /rest/sessions/getAllAvailableVehicles` (body `null`, entries have `isOwned`).
+
+Pressing Drive (`POST /rest/garage/drive`) then uploads and fetches the car's tyres (below);
+without a valid answer the client logs "failed all attempts to recieve tires from server,
+returning to monitor" (in a race: to the main menu).
+
+### Event type names
+
+The client names every event type (`FUN_140d44cd0`); the ones that matter for a server:
+`0xc0` SyncNotify, `0xc1` PlayerReady, `0xc2` PlayerVerifyOrig (our "Ready"), `0xc5`/`0xf0`
+ScoreBoard, `0xc9` CountDown, `0xca` NextPhase, `0xcc` YellowFlag, `0xcf` DNF, `0xd1`
+Disqualify, `0xd4` Auth Response, `0xe8` NetRestart, `0xe9` ClientView, `0xee` ClientKick,
+`0x93` SessionName, `0x94` WriteResults, `0x92` SendChat, `0x52` AddChatMsg, `0x142`
+PitState, `0x143` BasicScoreClient, `0x145`/`0x174` RaceState, `0x08`-`0x12` ZipLoc (car
+positions).
+
 ## Server-side HTTP used during a session
 
 | Request | Answer |
@@ -170,6 +219,9 @@ per session (`[Results] Post`); the server does not collect results yet.
 | `GET /mp_vehicle/{session}/{slot}` | 200 `{"vehicle": {}, "compressed_setup": null, "start_from_garage": true, "lock_setup_in_garage": false}` for a fresh car. A 404 makes the client log "Becoming spectator". |
 | `PUT /mp_vehicle*/...` | client uploads its car state/setup; store it and return it on later `GET`s |
 | `GET /teams/list/{n}` | polled every 5 s; `{"coherenceId": 0, "teams": {}, "drivers": {}}` (`coherenceId` must be a number) |
+| `POST /SaveTire/{slot}/{wheel}/{index}` | one tyre record, 0x1548 bytes; store it, answer 200 |
+| `POST /SetEquippedTire/{slot}/{wheel}/{index}` | which stored tyre is on that wheel; answer 200 |
+| `GET /GetTires/{slot}/{id}` | the four equipped tyres, wheels 0-3, exactly 4 x 0x1548 = 0x5520 bytes (any other size counts as a failure) |
 
 ## Entering the session
 
@@ -196,14 +248,14 @@ and the `build` check already catches that.
 ## Status
 
 Working with the retail client: join, track load (any track that has a BoP file), car
-request and slot assignment, taking control, clock sync, relaying cars between players
-(tested with `--ghost`), session progression P -> Q -> R (then back to the first session),
-clean disconnect, internet hosting through UPnP.
+choice, car request and slot assignment, the Drive button and driving out of the garage,
+clock sync, relaying cars between players (tested with `--ghost`), session progression
+P -> Q -> R (then back to the first session), race start (grid, start lights, green), clean
+disconnect, internet hosting through UPnP.
 
-Not done or not verified: a second real player (needs a second PC), the race start
-procedure (the race reaches `GPHASE_FORMATION`; green flag and finish not checked),
-server-side results, chat, and driver names (other players show the car's default driver
-name, because `0xe4` does not set the displayed name).
+Not done or not verified: a second real player (needs a second PC), the race finish
+(checkered flag), server-side results, chat, pit stops with limited tyre sets beyond the
+first set, and grid positions (cars start from their garages).
 
 Known crash: a client that has no car (never pressed Drive) crashed once when a race session
 began, in a test with 30-second sessions that changed while it was still loading. With a car

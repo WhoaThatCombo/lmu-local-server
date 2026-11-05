@@ -136,10 +136,40 @@ def game_running():
     return game_get("/rest/multiplayer/steam/status") is not None
 
 
-def join_and_enter(host, port, password, report):
-    """Join host:port like the game's server browser does, then enter the session like its UI does.
+def owned_cars():
+    """[(car id, label)] of the cars this player owns, from the list the game's multiplayer car
+    picker uses. Cars from DLC the player does not own cannot drive (the Drive button stays off)."""
+    _code, body = game_request("/rest/sessions/getAllAvailableVehicles", body="null", timeout=20)
+    cars = []
+    for c in json.loads(body):
+        if not c.get("isOwned"):
+            continue
+        path = [p.strip() for p in c.get("fullPathTree", "").split(",")]
+        series = path[0] if path else ""
+        model = path[-1] if len(path) > 1 else ""
+        cars.append((c["id"], f"{series} | {model} | {c.get('desc', c['id'])}"))
+    return sorted(cars, key=lambda x: x[1].lower())
+
+
+def selected_car():
+    """The car the game will use in a session: (id, description, owned) or None."""
+    setup = game_get("/rest/garage/UIScreen/SessionSetup", timeout=5)
+    car = setup.get("selectedCar") if isinstance(setup, dict) else None
+    if not isinstance(car, dict):
+        return None
+    return car.get("id"), car.get("desc", ""), bool(car.get("isOwned"))
+
+
+def join_and_enter(host, port, password, report, car_id=None):
+    """Join host:port like the game's server browser does, then enter the session like its UI does:
+    pick the car (as the multiplayer car screen does with SetCurrentVehicle) and NAV_RACE_MULTIPLAYER.
 
     report(text, final) is called from this worker thread with progress."""
+    state = game_get("/rest/multiplayer/join/state", timeout=3)
+    if state not in (None, "JOIN_IDLE", "JOIN_FAILURE"):
+        report(f"The game is still connected to or leaving a server ({state}). Leave it in the game "
+               "(or wait a few seconds), then connect again.", True)
+        return
     try:
         game_request("/rest/multiplayer/join",
                      {"host": host, "port": port, "password": password, "authentication": ""}, timeout=10)
@@ -152,7 +182,7 @@ def join_and_enter(host, port, password, report):
     last, progressed = None, False
     started = time.time()
     while time.time() - started < JOIN_TIMEOUT:
-        time.sleep(1)
+        time.sleep(0.5)
         state = game_get("/rest/multiplayer/join/state", timeout=3)
         if state != last:
             last = state
@@ -160,12 +190,24 @@ def join_and_enter(host, port, password, report):
         if state not in (None, "JOIN_IDLE", "JOIN_FAILURE"):
             progressed = True
         if state == "JOIN_JOINED_SERVER":
+            note = ""
+            if car_id:
+                try:
+                    game_request("/rest/garage/SetCurrentVehicle", body=json.dumps({"id": car_id}), timeout=15)
+                except OSError as e:
+                    note = f" Could not select the car ({e})."
+            car = selected_car()
+            if car and not car[2]:
+                note += (f" WARNING: the selected car ({car[1]}) is from DLC you do not own, so Drive will "
+                         "stay disabled. Leave, pick one of your cars in the Join tab, and connect again.")
             try:
                 game_request("/navigation/action/NAV_RACE_MULTIPLAYER", body="null", timeout=15)
             except OSError as e:
-                report(f"Joined, but entering the session failed ({e}). Use the game's menu.", True)
+                report(f"Joined, but entering the session failed ({e}). Use the game's menu.{note}", True)
                 return
-            report(f"Joined {host}:{port}. The game is loading the track; press Drive in the garage.", True)
+            driving = f" in {car[1]}" if car and car[2] else ""
+            report(f"Joined {host}:{port}{driving}. The game is loading the track; press Drive in the "
+                   f"garage.{note}", True)
             return
         if state in ("JOIN_FAILURE", "JOIN_IDLE") and (progressed or time.time() - started > 8):
             report(f"Join failed ({state}). Check the IP, port, password and that the server is running. "
@@ -311,6 +353,8 @@ DEFAULT_SETTINGS = {
     "upnp": "1",
     "connect_host": "",
     "connect_port": DEFAULT_HTTP_PORT,
+    "car_id": "",
+    "car_label": "",
 }
 
 
@@ -502,13 +546,59 @@ class App(tk.Tk):
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text="Password", width=18).pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.join_pass, show="*").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        crow = ttk.Frame(box)
+        crow.pack(fill=tk.X, pady=3)
+        ttk.Label(crow, text="Car", width=18).pack(side=tk.LEFT)
+        self.car_box = ttk.Combobox(crow, textvariable=self._var("car_label"), state="readonly")
+        self.car_box.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.car_box.bind("<<ComboboxSelected>>", lambda _e: self._car_selected())
+        ttk.Button(crow, text="Load my cars", command=self._load_cars).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(box, text="Connect", style="Accent.TButton", command=self._join).pack(anchor="w", pady=(8, 0))
         self.join_state = ttk.Label(box, text="", style="Muted.TLabel", wraplength=820, justify=tk.LEFT)
         self.join_state.pack(fill=tk.X, pady=(6, 0))
         ttk.Label(f, style="Muted.TLabel", wraplength=820, justify=tk.LEFT, text=(
-            "The car you drive is the one last selected in the game's menus; pick it before connecting. "
+            "Only cars you own are listed: with a DLC car you don't own, the game keeps Drive disabled. "
+            "The car is also used by Join my server on the Host tab. "
             "Everyone needs the same game version as the host.")).pack(fill=tk.X, pady=(10, 0))
+        self.cars = []
         return f
+
+    def _load_cars(self, quiet=False):
+        if not self.poller.snapshot.get("running") and not game_running():
+            if not quiet:
+                self.join_state.configure(text="Start LMU first; the car list comes from the game.")
+            return
+        self.join_state.configure(text="Loading your cars from the game...")
+
+        def work():
+            try:
+                cars = owned_cars()
+            except (OSError, ValueError, KeyError) as e:
+                self.join_msgs.put(f"Could not load the car list: {e}")
+                return
+            self.after(0, lambda: self._set_cars(cars))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_cars(self, cars):
+        self.cars = cars
+        self.car_box["values"] = [label for _id, label in cars]
+        ids = [car_id for car_id, _label in cars]
+        saved = self.settings.get("car_id")
+        if saved in ids:
+            self._var("car_label").set(cars[ids.index(saved)][1])
+        elif cars and self._var("car_label").get() not in self.car_box["values"]:
+            self._var("car_label").set("")
+        self.join_state.configure(text=f"{len(cars)} cars you own. Pick one, then connect.")
+
+    def _car_selected(self):
+        label = self._var("car_label").get()
+        for car_id, car_label in self.cars:
+            if car_label == label:
+                self.settings["car_id"] = car_id
+                self.settings["car_label"] = label
+                save_settings(self.settings)
+                return
 
     def _lan_tab(self, nb):
         f = ttk.Frame(nb, padding=12)
@@ -730,9 +820,10 @@ class App(tk.Tk):
             self._collect()
         except ValueError:
             pass
+        car_id = self.settings.get("car_id") or None
         self.join_state.configure(text=f"Joining {host}:{port}...")
         threading.Thread(target=join_and_enter, args=(host, port, password,
-                                                      lambda text, final: self.join_msgs.put(text)),
+                                                      lambda text, final: self.join_msgs.put(text), car_id),
                          daemon=True).start()
 
     def _join_selected(self):
@@ -748,6 +839,9 @@ class App(tk.Tk):
 
     def _tick(self):
         snap = self.poller.snapshot
+        if snap.get("running") and not self.cars and not getattr(self, "_cars_requested", False):
+            self._cars_requested = True
+            self._load_cars(quiet=True)
         if snap.get("running"):
             st = snap.get("state") if isinstance(snap.get("state"), dict) else {}
             self.status.configure(text=f"LMU running ({st.get('gameState', '?')}, {snap.get('join_state')})", fg=OK)
@@ -810,12 +904,14 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--join":
-        # command-line join, used by connect-to-server.bat: --join HOST [PORT] [PASSWORD]
+        # command-line join, used by connect-to-server.bat: --join HOST [PORT] [PASSWORD] [CAR_ID]
+        # (the car defaults to the one picked in the toolkit's Join tab)
         host = sys.argv[2]
         port = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_HTTP_PORT
         password = sys.argv[4] if len(sys.argv) > 4 else ""
+        car = sys.argv[5] if len(sys.argv) > 5 else load_settings().get("car_id") or None
         if not game_running():
             sys.exit("Le Mans Ultimate is not running. Start the game, wait for the main menu, then try again.")
-        join_and_enter(host, port, password, lambda text, final: print(text, flush=True))
+        join_and_enter(host, port, password, lambda text, final: print(text, flush=True), car)
     else:
         App().mainloop()

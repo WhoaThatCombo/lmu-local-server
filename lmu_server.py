@@ -91,7 +91,48 @@ class Server:
         self.rules_hash = hashlib.sha256(RULES_SALT_FMT.format(self.rules_body).encode()).hexdigest()
         self.guid = "{%s}" % str(uuid.uuid5(uuid.NAMESPACE_DNS, f"lmu-local-{a.name}")).upper()
         self.http_store = {}
+        self.tires = {}      # (slot, wheel, index) -> tyre record uploaded with SaveTire
+        self.equipped = {}   # (slot, wheel) -> index chosen with SetEquippedTire
         self.build = a.build if a.build is not None else game_build(a.game_dir)
+
+    def tire_request(self, method, path, body):
+        """The tyre inventory the client keeps on the server (limited tyre rules).
+
+        POST /SaveTire/{slot}/{wheel}/{index}: one tyre record (0x1548 bytes).
+        POST /SetEquippedTire/{slot}/{wheel}/{index}: which tyre is on that wheel.
+        GET /GetTires/{slot}/{id}: the four equipped tyres, wheel 0-3, exactly 4 x 0x1548 bytes.
+        Pressing Drive calls GetTires; any other answer sends the player back to the garage monitor
+        ("failed all attempts to recieve tires from server"), or to the main menu in a race.
+        Returns (status, body) or None when the path is not a tyre request."""
+        parts = path.strip("/").split("/")
+        name = parts[0]
+        if name not in ("savetire", "setequippedtire", "gettires"):
+            return None
+        try:
+            nums = [int(p) for p in parts[1:4] if p.lstrip("-").isdigit()]
+        except ValueError:
+            nums = []
+        if name == "savetire" and method == "POST" and len(nums) == 3:
+            self.tires[tuple(nums)] = body
+            return 200, "{}"
+        if name == "setequippedtire" and method == "POST" and len(nums) == 3:
+            slot, wheel, index = nums
+            self.equipped[(slot, wheel)] = index
+            return 200, "{}"
+        if name == "gettires" and method == "GET" and nums:
+            slot = nums[0]
+            out = b""
+            for wheel in range(4):
+                index = self.equipped.get((slot, wheel), 0)
+                record = self.tires.get((slot, wheel, index))
+                if record is None:
+                    record = next((v for (s, w, _i), v in sorted(self.tires.items()) if s == slot and w == wheel),
+                                  None)
+                if record is None:
+                    return 404, json.dumps({"error": f"no tyres saved for slot {slot} wheel {wheel}"})
+                out += record[:TIRE_RECORD_SIZE].ljust(TIRE_RECORD_SIZE, b"\0")
+            return 200, out
+        return 404, json.dumps({"error": "bad tyre request"})
 
     def session_info(self):
         players = [{"name": n.name, "countryCode": ""} for n in (self.sim.real_nodes() if self.sim else []) if n.name]
@@ -176,6 +217,7 @@ EV_WELCOME = 0xE7             # S->C no body
 EV_VEHICLE_RESPONSE = 0xF3    # S->C body[0] = approved
 EV_TAKE_CONTROL = 0xF4        # C->S
 EV_TAKE_CONTROL_RESPONSE = 0xF5  # S->C body[0] = approved
+EV_RACE_STATE2 = 0x174        # S->C "Other::RaceState2": phase, session times, per-slot finish status
 EV_SESSION_READY = 0xF8       # C->S no body, sent on entering a session
 EV_SESSION_ACK = 0xF9         # S->C clears the client's "re-apply session description" flag (+0x140)
 EVENT_NAMES = {
@@ -183,7 +225,7 @@ EVENT_NAMES = {
     EV_SLOT_VEHICLE: "SlotVehicle", EV_SLOT_ASSIGNMENT: "SlotAssignment", EV_DRIVER_INFO: "DriverInfo",
     EV_ACTIVE_DRIVER: "ActiveDriver", EV_WELCOME: "Welcome", EV_VEHICLE_RESPONSE: "VehicleResponse",
     EV_TAKE_CONTROL: "TakeControl", EV_TAKE_CONTROL_RESPONSE: "TakeControlResponse",
-    EV_SESSION_READY: "SessionReady", EV_SESSION_ACK: "SessionAck",
+    EV_SESSION_READY: "SessionReady", EV_SESSION_ACK: "SessionAck", EV_RACE_STATE2: "RaceState2",
 }
 MAX_SLOTS = 0x68
 GHOST_NODE_ID = 200  # must stay below 0x268 (client per-node arrays)
@@ -295,6 +337,51 @@ def parse_event(data):
             "session": (header >> 26) & 0xF, "flags": header >> 30, "body": data[8:8 + size]}
 
 
+# Game phases (rFactor 2 numbering) and the race start used by the server.
+PHASE_BEFORE, PHASE_FORMATION, PHASE_COUNTDOWN, PHASE_GREEN, PHASE_OVER = 0, 3, 4, 5, 8
+PHASE_NAMES = {0: "before", 3: "formation", 4: "countdown", 5: "green", 8: "over"}
+RACE_GRID_SECONDS = 30.0       # race: everyone waits on the grid this long (time to load in)
+RACE_COUNTDOWN_SECONDS = 5.0   # then the start lights, then green
+FLT_MAX = 3.4028234663852886e38
+TIRE_RECORD_SIZE = 0x1548      # one tyre in SaveTire / GetTires (GetTires = 4 of them)
+RACE_STATE_INTERVAL = 5.0
+
+
+def build_race_state(phase, start, end, slots):
+    """Body of RaceState2 (0x174), parsed by the client in ProcessRaceStateEvent2() (steward.cpp).
+
+    u8 phase | yellow-flag state << 4, then six floats: session start time (twice), session end
+    time, and three more times the game resets to FLT_MAX ("none"). Then 3 bytes per car:
+    u16 = slot << 8 | finish status << 6 (0 racing, 1 finished, 2 DNF, 3 DQ) | two small fields
+    (left 0), and an i8 qualifying position. A car whose finish status is not 0 cannot drive:
+    the UI's Drive button (/rest/race/getAllowedToStartRacing) stays disabled."""
+    body = struct.pack("<B6f", phase & 0x0F, start, start, end, FLT_MAX, FLT_MAX, FLT_MAX)
+    for position, slot in enumerate(slots):
+        body += struct.pack("<Hb", slot << 8, position)
+    return body
+
+
+def exclusive_socket(kind):
+    """A socket that refuses to share its port. On Windows SO_REUSEADDR (Python's HTTP server default)
+    lets a second server bind the same port, and joins then land on whichever one Windows picks."""
+    s = socket.socket(socket.AF_INET, kind)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    elif kind == socket.SOCK_STREAM:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    return s
+
+
+class ExclusiveHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = not hasattr(socket, "SO_EXCLUSIVEADDRUSE")
+    daemon_threads = True
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def build_event(ev_type, body=b"", slot=0xFF, session=0, flags=3, time_=0):
     header = slot | (len(body) << 8) | (ev_type << 17) | (session << 26) | (flags << 30)
     return struct.pack("<II", time_, header) + body
@@ -320,14 +407,18 @@ class SimServer:
         self.delayed = []
         self.delayed_cv = threading.Condition()
         self._seq = itertools.count()
-        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp = exclusive_socket(socket.SOCK_DGRAM)
         self.udp.bind(("0.0.0.0", port))
+        self.tcp = exclusive_socket(socket.SOCK_STREAM)
+        self.tcp.bind(("0.0.0.0", port))
+        self.tcp.listen(16)
 
     def start(self):
         threading.Thread(target=self._udp_loop, daemon=True).start()
         threading.Thread(target=self._tcp_loop, daemon=True).start()
         threading.Thread(target=self._delay_loop, daemon=True).start()
         threading.Thread(target=self._schedule_loop, daemon=True).start()
+        threading.Thread(target=self._race_state_loop, daemon=True).start()
         extra = f", ghost delay {self.ghost_delay:g}s" if self.ghost_delay else ""
         probe.log("sim", f":{self.port}", f"listening (tcp+udp), session {self.schedule.label}" + extra)
 
@@ -349,6 +440,46 @@ class SimServer:
                 time.sleep(2)
                 for node in self.real_nodes():
                     self.send_event(node, EV_SESSION_ACK)
+
+    def race_phase(self):
+        """(phase, start, end) for the current session. Practice/qualifying are green from the start;
+        a race holds everyone on the grid, runs the start lights, then goes green."""
+        length = self.schedule.items[self.schedule.index][1]
+        if self.schedule.session < 10:
+            return PHASE_GREEN, 0.0, length
+        elapsed = self.schedule.elapsed()
+        green_at = RACE_GRID_SECONDS + RACE_COUNTDOWN_SECONDS
+        if elapsed < RACE_GRID_SECONDS:
+            phase = PHASE_BEFORE
+        elif elapsed < green_at:
+            phase = PHASE_COUNTDOWN
+        else:
+            phase = PHASE_GREEN
+        return phase, green_at, max(length, green_at + 60.0)
+
+    def send_race_state(self, nodes=None):
+        phase, start, end = self.race_phase()
+        with self.lock:
+            slots = sorted(self.slots)
+        body = build_race_state(phase, start, end, slots)
+        for node in nodes if nodes is not None else self.real_nodes():
+            self.send_event(node, EV_RACE_STATE2, body, quiet=True)
+        return phase
+
+    def _race_state_loop(self):
+        """Resend the race state every RACE_STATE_INTERVAL seconds, and at once when the phase changes.
+        (Each update makes clients re-run AssignPitAndGarage, so not more often than needed.)"""
+        last, sent_at = None, 0.0
+        while True:
+            time.sleep(0.5)
+            state = (self.race_phase()[0], self.schedule.session)
+            if state == last and time.monotonic() - sent_at < RACE_STATE_INTERVAL:
+                continue
+            self.send_race_state()
+            sent_at = time.monotonic()
+            if state != last:
+                last = state
+                probe.log("sim", "session", f"{self.schedule.label}: phase {PHASE_NAMES.get(state[0], state[0])}")
 
     def disconnect_all(self):
         """Drop every player. Their games return to the menu; keep HTTP up a little longer afterwards,
@@ -423,10 +554,7 @@ class SimServer:
     # ------------------------------------------------------------------ TCP
 
     def _tcp_loop(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("0.0.0.0", self.port))
-        s.listen(16)
+        s = self.tcp
         while True:
             conn, addr = s.accept()
             threading.Thread(target=self._tcp_session, args=(conn, addr), daemon=True).start()
@@ -504,6 +632,7 @@ class SimServer:
             return
         if kind == SYS_CLIENT_INFO_REQUEST and len(payload) >= 17 and node:
             node.info = bytes(payload[17:])
+            probe.log("tcp", peer, f"ClientInfoUpdate {len(node.info)} bytes", node.info)
             first = not node.info_sent
             node.info_sent = True
             for other in self.real_nodes():
@@ -566,6 +695,12 @@ class SimServer:
                 self._announce_slot(node, other)
         elif t == EV_SESSION_READY:
             self.send_event(node, EV_SESSION_ACK)
+            self.send_race_state([node])
+            if node.slot is None:
+                # Loading the session resets the client's "server is ready" flag (+0x145, set by Ready);
+                # without a fresh Ready a game that already joined once never asks for a car and the
+                # UI's Drive button stays disabled (getAllowedToStartRacing = false).
+                self.send_event(node, EV_READY, bytes([0xFF]))
         elif t == EV_VEHICLE_REQUEST:
             self._assign_vehicle(node, body)
         elif t == EV_TAKE_CONTROL:
@@ -656,8 +791,25 @@ class SimServer:
         for other in self.real_nodes():
             self._announce_slot(other, node)
         self.send_event(node, EV_VEHICLE_RESPONSE, b"\x01")
+        self.send_race_state()
+        threading.Thread(target=self._confirm_slot, args=(node,), daemon=True).start()
         if self.ghost_delay and self.ghost is None:
             self._spawn_ghost(node)
+
+    def _confirm_slot(self, node):
+        """Re-send SlotAssignment until the client's own info (02) carries its slot at byte 0x24.
+
+        The client only records the slot if it handles SlotAssignment after the car has loaded; a
+        single assignment sent straight back with the VehicleResponse is often too early. Without the
+        slot in its info the game keeps Drive disabled (getAllowedToStartRacing checks that byte)."""
+        for delay in (1.0, 2.0, 3.0, 5.0, 8.0):
+            time.sleep(delay)
+            if node.slot is None or node.node_id not in self.nodes:
+                return
+            if len(node.info) > 0x24 and node.info[0x24] == node.slot:
+                return
+            probe.log("tcp", node.peer, f"client has not confirmed slot {node.slot} yet; re-sending SlotAssignment")
+            self.send_event(node, EV_SLOT_ASSIGNMENT, bytes([node.slot]), quiet=True)
 
     def _spawn_ghost(self, real):
         with self.lock:
@@ -693,13 +845,13 @@ def make_handler(server):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
-            probe.log("http", self.client_address[0], f"-> {code} {len(data)} bytes", data[:512])
+            probe.log("http", self.client_address[0], f"-> {code} {len(data)} bytes", data[:256])
 
         def _route(self, method):
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else b""
             probe.log("http", f"{self.client_address[0]}:{self.client_address[1]}",
-                      f"{method} {self.path} ua={self.headers.get('User-Agent')}", body)
+                      f"{method} {self.path} ({len(body)} bytes) ua={self.headers.get('User-Agent')}", body[:256])
             raw_path = self.path.split("?")[0].rstrip("/")
             path = raw_path.lower()
             store_key = next((p for p in ("/mp_vehicle_setup/", "/mp_vehicle_pm/", "/mp_vehicle/")
@@ -716,6 +868,11 @@ def make_handler(server):
                     return self._send(200, json.dumps({"vehicle": {}, "compressed_setup": None,
                                                        "start_from_garage": True, "lock_setup_in_garage": False}))
                 return self._send(404, json.dumps({"error": "no stored state"}))
+            tire = server.tire_request(method, path, body)
+            if tire is not None:
+                code, data = tire
+                return self._send(code, data, "application/octet-stream" if code == 200 and data else
+                                  "application/json")
             if path.startswith("/teams/list"):
                 return self._send(200, json.dumps({"coherenceId": 0, "teams": {}, "drivers": {}}))
             if path == "/sessioninfo":
@@ -822,9 +979,14 @@ def main():
     probe.log("server", "-", f"start http={a.http} sim={a.sim} build={srv.build} scene={a.scene} "
               f"bop={srv.bop_file.name} components={len(srv.components)} rules={srv.rules_hash}")
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", a.http), make_handler(srv))
+    try:
+        httpd = ExclusiveHTTPServer(("0.0.0.0", a.http), make_handler(srv))
+        sim = SimServer(a.sim, a.idle, (a.name, a.scene, a.max_players), schedule, ghost_delay=a.ghost)
+    except OSError as e:
+        probe.log("server", "-", f"cannot open the ports (HTTP {a.http}, simulation {a.sim}): {e}. "
+                                 "Is another server still running?")
+        return 1
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    sim = SimServer(a.sim, a.idle, (a.name, a.scene, a.max_players), schedule, ghost_delay=a.ghost)
     srv.sim = sim
     sim.start()
     time.sleep(0.5)
