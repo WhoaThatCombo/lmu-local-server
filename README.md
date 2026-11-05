@@ -8,6 +8,10 @@ The retail game cannot host (see [REVERSE_ENGINEERING_FINDINGS.md](REVERSE_ENGIN
 
 Not affiliated with or endorsed by Motorsport Games, Studio 397 or RaceControl. Use at your own risk and respect the game's terms of service. Nothing here modifies game files or touches Easy Anti-Cheat.
 
+## Contributing
+
+What's missing is tracked in the [issues](https://github.com/WhoaThatCombo/lmu-local-server/issues). To continue the project, start with [CONTRIBUTING.md](CONTRIBUTING.md): code map, how to test against the game, and how the protocol was reverse engineered.
+
 ## Requirements
 
 - Windows, Le Mans Ultimate (Steam), and the same game version for everyone
@@ -59,12 +63,14 @@ Only the host needs open ports.
 |------|---------|
 | `lmu_server.py` | The server |
 | `upnp.py` | Router port mapping (standard library only) |
-| `lmu_server_toolkit.py` | GUI to host and join; also `--join HOST [PORT] [PASSWORD]` |
+| `lmu_server_toolkit.py` | GUI to host and join; also `--join HOST [PORT] [PASSWORD] [--car ID]` |
 | `lmu_protocol_probe.py` | Logging, listeners and the local-game join helper used by the server |
 | `start-server.bat` | Opens the toolkit |
 | `connect-to-server.bat` | Command-line join |
 | `PROTOCOL.md` | The client/server protocol |
 | `REVERSE_ENGINEERING_FINDINGS.md` | Why the retail game cannot host |
+| `CONTRIBUTING.md` | Hand-off guide: code map, testing, reverse-engineering workflow |
+| `tools/` | Live test script and headless Ghidra scripts |
 
 ## After a game update
 

@@ -904,12 +904,19 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "--join":
-        # command-line join, used by connect-to-server.bat: --join HOST [PORT] [PASSWORD] [CAR_ID]
+        # command-line join, used by connect-to-server.bat:
+        #   --join HOST [PORT] [PASSWORD] [--car CAR_ID]
         # (the car defaults to the one picked in the toolkit's Join tab)
-        host = sys.argv[2]
-        port = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_HTTP_PORT
-        password = sys.argv[4] if len(sys.argv) > 4 else ""
-        car = sys.argv[5] if len(sys.argv) > 5 else load_settings().get("car_id") or None
+        args = sys.argv[2:]
+        car = None
+        if "--car" in args:
+            i = args.index("--car")
+            car = args[i + 1] if i + 1 < len(args) else None
+            del args[i:i + 2]
+        host = args[0]
+        port = args[1] if len(args) > 1 else DEFAULT_HTTP_PORT
+        password = args[2] if len(args) > 2 else ""
+        car = car or load_settings().get("car_id") or None
         if not game_running():
             sys.exit("Le Mans Ultimate is not running. Start the game, wait for the main menu, then try again.")
         join_and_enter(host, port, password, lambda text, final: print(text, flush=True), car)
