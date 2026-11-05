@@ -1,31 +1,40 @@
-"""LMU Local Server Toolkit - host and join Le Mans Ultimate races on your own machine."""
+"""LMU Local Server Toolkit - host and join Le Mans Ultimate races without renting a server.
+
+Hosting runs lmu_server.py (our own server, see PROTOCOL.md) in the background. Joining tells a
+running game to connect through its local REST API, then enters the session like the game's UI.
+"""
 
 import json
 import os
+import queue
 import re
-import shutil
 import socket
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from urllib.parse import quote, urlencode
 from urllib.error import HTTPError
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+import upnp
+
+HERE = Path(__file__).resolve().parent
 APP_ID = "2399420"
 GAME_EXE = "Le Mans Ultimate.exe"
 GAME_API_PORT = 6397
 LAN_BROADCAST_PORT = 5399
 LAN_MAGIC = "LMU_LAN_SERVER"
-# rFactor 2 defaults; the values in the profile's Multiplayer.JSON win when present.
-DEFAULT_SIM_PORT = 54297
-DEFAULT_HTTP_PORT = 64297
-SETTINGS_FILE = Path(__file__).with_name("toolkit_settings.json")
+DEFAULT_HTTP_PORT = 64298
+DEFAULT_SIM_PORT = 54298
+SETTINGS_FILE = HERE / "toolkit_settings.json"
+SERVER_LOG = HERE / "lmu_server.log"
+DATA_DIR = HERE / "data"
 FIREWALL_RULE_PREFIX = "LMU Local Server"
-LAUNCH_TIMEOUT = 180
+JOIN_TIMEOUT = 120
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -56,85 +65,39 @@ def find_game_dir():
     return ""
 
 
-def find_profiles(game_dir):
-    user_data = Path(game_dir) / "UserData"
-    if not user_data.exists():
+def track_scenes():
+    """Tracks the server can host: one BoP file per layout in data/bop (named like the sceneDesc)."""
+    bop = DATA_DIR / "bop"
+    if not bop.is_dir():
         return []
-    return sorted(p.parent.name for p in user_data.glob("*/Multiplayer.JSON"))
+    return sorted(p.stem.upper() for p in bop.glob("*.json") if not p.stem.startswith("_") and p.stem != "default")
 
 
-def multiplayer_json_path(game_dir, profile):
-    return Path(game_dir) / "UserData" / profile / "Multiplayer.JSON"
-
-
-# ---------------------------------------------------------------- Multiplayer.JSON
-
-def read_mp_values(path, keys):
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
-    found = {}
-    for section in data.values():
-        if isinstance(section, dict):
-            for k in keys:
-                if k in section:
-                    found[k] = section[k]
-    return found
-
-
-def patch_mp_json(path, values):
-    """Set existing keys only, keeping the game's own structure. Returns keys not found."""
-    path = Path(path)
-    data = json.loads(path.read_text(encoding="utf-8"))
-    missing = set(values)
-    for section in data.values():
-        if isinstance(section, dict):
-            for k, v in values.items():
-                if k in section:
-                    section[k] = v
-                    missing.discard(k)
-    backup = path.with_suffix(".JSON.bak")
-    if not backup.exists():
-        shutil.copy2(path, backup)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return sorted(missing)
+def server_data_missing():
+    missing = []
+    if not (DATA_DIR / "default.rules.json").exists():
+        missing.append(str(DATA_DIR / "default.rules.json"))
+    if not track_scenes():
+        missing.append(str(DATA_DIR / "bop" / "<Track>.json"))
+    return missing
 
 
 # ---------------------------------------------------------------- networking helpers
-
-def lan_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("10.255.255.255", 1))
-        return s.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        s.close()
-
 
 def public_ip():
     with urlopen("https://api.ipify.org", timeout=5) as r:
         return r.read().decode().strip()
 
 
-def tcp_listening(port, host="127.0.0.1"):
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except OSError:
-        return False
+def firewall_rules(http_port, sim_port):
+    return [("TCP", http_port), ("TCP", sim_port), ("UDP", sim_port)]
 
 
-def firewall_script(http_port, sim_port, max_clients):
-    sim_range = f"{sim_port}-{sim_port + max_clients}"
-    rules = [("TCP", http_port), ("UDP", http_port), ("TCP", sim_range), ("UDP", sim_range)]
+def open_firewall(http_port, sim_port):
+    rules = firewall_rules(http_port, sim_port)
     lines = [f'netsh advfirewall firewall delete rule name="{FIREWALL_RULE_PREFIX}" >nul']
     lines += [f'netsh advfirewall firewall add rule name="{FIREWALL_RULE_PREFIX}" dir=in action=allow '
-              f'protocol={proto} localport={ports}' for proto, ports in rules]
-    return lines, rules
-
-
-def open_firewall(http_port, sim_port, max_clients):
-    lines, rules = firewall_script(http_port, sim_port, max_clients)
+              f'protocol={proto} localport={port}' for proto, port in rules]
     script = Path(os.environ.get("TEMP", ".")) / "lmu_firewall.cmd"
     script.write_text("@echo off\r\n" + "\r\n".join(lines) + "\r\n", encoding="ascii")
     subprocess.run(["powershell", "-NoProfile", "-Command",
@@ -145,19 +108,21 @@ def open_firewall(http_port, sim_port, max_clients):
 
 # ---------------------------------------------------------------- the running game
 
-def game_api(path, params=None, timeout=5):
+def game_request(path, params=None, body=None, timeout=5):
     url = f"http://127.0.0.1:{GAME_API_PORT}{path}"
     if params:
         url += "?" + urlencode(params)
-    with urlopen(Request(url, headers={"Content-Type": "application/json"}), timeout=timeout) as r:
+    data = body.encode() if body is not None else None
+    req = Request(url, data=data, method="POST" if data is not None else "GET",
+                  headers={"Content-Type": "application/json"})
+    with urlopen(req, timeout=timeout) as r:
         return r.status, r.read().decode(errors="ignore")
 
 
 def game_get(path, timeout=1):
     try:
-        _code, body = game_api(path, timeout=timeout)
+        _code, body = game_request(path, timeout=timeout)
     except HTTPError as e:
-        # e.g. GetGameState answers 503 with a JSON explanation when no session is loaded
         body = e.read().decode(errors="ignore")
     except OSError:
         return None
@@ -171,38 +136,45 @@ def game_running():
     return game_get("/rest/multiplayer/steam/status") is not None
 
 
-def join_server(host, port, password=""):
-    return game_api("/rest/multiplayer/join",
-                    {"host": host, "port": port, "password": password, "authentication": ""},
-                    timeout=10)
+def join_and_enter(host, port, password, report):
+    """Join host:port like the game's server browser does, then enter the session like its UI does.
 
-
-def send_chat(message):
-    req = Request(f"http://127.0.0.1:{GAME_API_PORT}/rest/chat/", data=message.encode("utf-8"),
-                  headers={"Content-Type": "text/plain"}, method="POST")
-    with urlopen(req, timeout=3) as r:
-        return r.status
-
-
-def game_pids():
-    out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {GAME_EXE}", "/FO", "CSV", "/NH"],
-                         capture_output=True, text=True, creationflags=NO_WINDOW).stdout
-    return [int(row.split('","')[1]) for row in out.splitlines() if row.startswith(f'"{GAME_EXE}"')]
-
-
-def close_game(timeout=30):
-    """Ask the game to close like clicking the window's X; returns True once it has exited."""
-    for pid in game_pids():
-        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True, creationflags=NO_WINDOW)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if not game_pids():
-            return True
+    report(text, final) is called from this worker thread with progress."""
+    try:
+        game_request("/rest/multiplayer/join",
+                     {"host": host, "port": port, "password": password, "authentication": ""}, timeout=10)
+    except HTTPError as e:
+        report(f"The game refused the join (HTTP {e.code}). If it is stuck joining, restart it.", True)
+        return
+    except OSError as e:
+        report(f"Could not reach the game: {e}", True)
+        return
+    last, progressed = None, False
+    started = time.time()
+    while time.time() - started < JOIN_TIMEOUT:
         time.sleep(1)
-    return False
+        state = game_get("/rest/multiplayer/join/state", timeout=3)
+        if state != last:
+            last = state
+            report(f"Joining {host}:{port}: {state}", False)
+        if state not in (None, "JOIN_IDLE", "JOIN_FAILURE"):
+            progressed = True
+        if state == "JOIN_JOINED_SERVER":
+            try:
+                game_request("/navigation/action/NAV_RACE_MULTIPLAYER", body="null", timeout=15)
+            except OSError as e:
+                report(f"Joined, but entering the session failed ({e}). Use the game's menu.", True)
+                return
+            report(f"Joined {host}:{port}. The game is loading the track; press Drive in the garage.", True)
+            return
+        if state in ("JOIN_FAILURE", "JOIN_IDLE") and (progressed or time.time() - started > 8):
+            report(f"Join failed ({state}). Check the IP, port, password and that the server is running. "
+                   "Players need the same game version as the host.", True)
+            return
+    report("Join timed out.", True)
 
 
-def launch_via_steam(args):
+def launch_via_steam(args=()):
     """Start the game through Steam so Steam, anti-cheat and the user's launch options apply."""
     root = steam_root()
     steam_exe = root / "steam.exe" if root else None
@@ -215,31 +187,62 @@ def launch_via_steam(args):
 class GamePoller(threading.Thread):
     """Polls the running game's local API in the background so the UI never blocks."""
 
-    def __init__(self, http_port_fn):
+    def __init__(self):
         super().__init__(daemon=True)
-        self.http_port_fn = http_port_fn
         self.snapshot = {"running": False}
         self.stop_event = threading.Event()
 
     def run(self):
         while not self.stop_event.is_set():
             snap = {"running": False}
-            cmd = game_get("/rest/options/commandline")
-            if cmd is not None:
-                line = cmd.get("commandLine", "") if isinstance(cmd, dict) else str(cmd)
+            if game_running():
                 snap = {
                     "running": True,
-                    "command_line": line,
-                    "hosting_args": "+host" in line.lower(),
-                    "eac": game_get("/rest/profile/eacActive"),
                     "state": game_get("/rest/sessions/GetGameState") or {},
                     "join_state": game_get("/rest/multiplayer/join/state"),
-                    "chat": game_get("/rest/chat/") or [],
                 }
-            port = self.http_port_fn()
-            snap["listening"] = bool(port) and tcp_listening(port)
             self.snapshot = snap
             self.stop_event.wait(2)
+
+
+# ---------------------------------------------------------------- the server process
+
+class ServerProcess:
+    """lmu_server.py running in the background; its output lines are collected in a queue."""
+
+    def __init__(self):
+        self.proc = None
+        self.lines = queue.Queue()
+        self.join_address = None
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self, args):
+        self.join_address = None
+        cmd = [sys.executable, "-u", str(HERE / "lmu_server.py"), *args, "--stdin-control", "--log", str(SERVER_LOG)]
+        self.proc = subprocess.Popen(cmd, cwd=HERE, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                     creationflags=NO_WINDOW)
+        threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            line = line.rstrip()
+            m = re.search(r"ready: players join (\S+)", line)
+            if m:
+                self.join_address = m.group(1)
+            self.lines.put(line)
+        self.lines.put(f"--- server exited (code {proc.wait()})")
+
+    def stop(self):
+        """Graceful stop: players are sent back to the menu, router ports are closed (takes ~10 s)."""
+        if self.running():
+            try:
+                self.proc.stdin.write("stop\n")
+                self.proc.stdin.close()
+            except OSError:
+                self.proc.terminate()
 
 
 # ---------------------------------------------------------------- LAN discovery
@@ -298,14 +301,14 @@ class LANListener(threading.Thread):
 
 DEFAULT_SETTINGS = {
     "game_dir": "",
-    "profile": "player",
     "server_name": "LMU Local Server",
     "join_password": "",
-    "admin_password": "",
-    "max_clients": 16,
-    "sim_port": DEFAULT_SIM_PORT,
+    "max_clients": 20,
     "http_port": DEFAULT_HTTP_PORT,
-    "extra_args": "+host",
+    "sim_port": DEFAULT_SIM_PORT,
+    "scene": "SPAWEC",
+    "sessions": "P:30,Q:15,R:30",
+    "upnp": "1",
     "connect_host": "",
     "connect_port": DEFAULT_HTTP_PORT,
 }
@@ -314,9 +317,15 @@ DEFAULT_SETTINGS = {
 def load_settings():
     settings = dict(DEFAULT_SETTINGS)
     try:
-        settings.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        settings.update({k: v for k, v in saved.items() if k in DEFAULT_SETTINGS})
     except (OSError, ValueError):
         pass
+    # rFactor 2 ports from the old +host approach
+    if str(settings["http_port"]) == "64297" and str(settings["sim_port"]) == "54297":
+        settings["http_port"], settings["sim_port"] = DEFAULT_HTTP_PORT, DEFAULT_SIM_PORT
+    if str(settings["connect_port"]) == "64297":
+        settings["connect_port"] = DEFAULT_HTTP_PORT
     if not settings["game_dir"] or not (Path(settings["game_dir"]) / GAME_EXE).exists():
         settings["game_dir"] = find_game_dir()
     return settings
@@ -336,16 +345,16 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("LMU Local Server Toolkit")
-        self.geometry("880x660")
-        self.minsize(780, 580)
+        self.geometry("900x700")
+        self.minsize(800, 600)
         self.configure(bg=BG)
         self.settings = load_settings()
-        self.launch_requested_at = None
-        self.busy = False
+        self.server = ServerProcess()
+        self.stopping_since = None
         self._public_ip = None
-        self._chat_seen = None
         self.vars = {}
-        self.poller = GamePoller(lambda: self.settings.get("http_port"))
+        self.join_msgs = queue.Queue()
+        self.poller = GamePoller()
         self.poller.start()
         self.listener = LANListener()
         self.listener.start()
@@ -353,7 +362,6 @@ class App(tk.Tk):
         self.broadcaster.start()
         self._style()
         self._build()
-        self._load_from_profile(quiet=True)
         self.after(500, self._tick)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -365,6 +373,8 @@ class App(tk.Tk):
         s.configure(".", background=BG, foreground=TEXT, fieldbackground=PANEL, font=("Segoe UI", 10))
         s.configure("TFrame", background=BG)
         s.configure("TLabel", background=BG, foreground=TEXT)
+        s.configure("TCheckbutton", background=BG, foreground=TEXT)
+        s.map("TCheckbutton", background=[("active", BG)])
         s.configure("Title.TLabel", foreground=ACCENT, font=("Segoe UI", 16, "bold"))
         s.configure("Muted.TLabel", foreground=MUTED)
         s.configure("TLabelframe", background=BG, bordercolor="#2c3247")
@@ -386,7 +396,7 @@ class App(tk.Tk):
             self.vars[key] = tk.StringVar(value=str(self.settings.get(key, "")))
         return self.vars[key]
 
-    def _row(self, parent, label, key, show=None, width=None, browse=None):
+    def _row(self, parent, label, key, show=None, width=None, browse=None, hint=None):
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text=label, width=18).pack(side=tk.LEFT)
@@ -394,6 +404,8 @@ class App(tk.Tk):
         e.pack(side=tk.LEFT, fill=tk.X if not width else tk.NONE, expand=not width)
         if browse:
             ttk.Button(row, text="Browse", command=browse).pack(side=tk.LEFT, padx=(6, 0))
+        if hint:
+            ttk.Label(row, text=hint, style="Muted.TLabel").pack(side=tk.LEFT, padx=(8, 0))
         return e
 
     def _build(self):
@@ -406,7 +418,6 @@ class App(tk.Tk):
         nb = ttk.Notebook(self)
         nb.pack(fill=tk.BOTH, expand=True, padx=14, pady=(4, 14))
         nb.add(self._host_tab(nb), text="Host")
-        nb.add(self._live_tab(nb), text="Live Game")
         nb.add(self._share_tab(nb), text="Share / Ports")
         nb.add(self._join_tab(nb), text="Join")
         nb.add(self._lan_tab(nb), text="LAN Browser")
@@ -414,67 +425,41 @@ class App(tk.Tk):
     def _host_tab(self, nb):
         f = ttk.Frame(nb, padding=12)
 
-        game = ttk.LabelFrame(f, text="Game", padding=10)
-        game.pack(fill=tk.X)
-        self._row(game, "Install folder", "game_dir", browse=self._browse_game)
-        prow = ttk.Frame(game)
-        prow.pack(fill=tk.X, pady=3)
-        ttk.Label(prow, text="Profile", width=18).pack(side=tk.LEFT)
-        self.profile_box = ttk.Combobox(prow, textvariable=self._var("profile"), width=20)
-        self.profile_box.pack(side=tk.LEFT)
-        ttk.Button(prow, text="Reload from profile", command=self._load_from_profile).pack(side=tk.LEFT, padx=6)
-        self.profile_note = ttk.Label(game, text="", style="Muted.TLabel", wraplength=800, justify=tk.LEFT)
-        self.profile_note.pack(fill=tk.X, pady=(4, 0))
-
-        srv = ttk.LabelFrame(f, text="Server settings (written to the profile's Multiplayer.JSON)", padding=10)
-        srv.pack(fill=tk.X, pady=10)
+        srv = ttk.LabelFrame(f, text="Server", padding=10)
+        srv.pack(fill=tk.X)
         self._row(srv, "Server name", "server_name")
-        self._row(srv, "Join password", "join_password", show="*")
-        self._row(srv, "Admin password", "admin_password", show="*")
-        self._row(srv, "Max clients", "max_clients", width=8)
+        self._row(srv, "Join password", "join_password", show="*", hint="empty = no password")
+        self._row(srv, "Max players", "max_clients", width=8)
         self._row(srv, "HTTP port (join)", "http_port", width=8)
         self._row(srv, "Simulation port", "sim_port", width=8)
-        self._row(srv, "Launch arguments", "extra_args")
+        trow = ttk.Frame(srv)
+        trow.pack(fill=tk.X, pady=3)
+        ttk.Label(trow, text="Track", width=18).pack(side=tk.LEFT)
+        ttk.Combobox(trow, textvariable=self._var("scene"), values=track_scenes(), width=30).pack(side=tk.LEFT)
+        self._row(srv, "Sessions", "sessions",
+                  hint="minutes: P practice, Q qualifying, W warmup, R race; repeats after the last")
+        self.upnp_var = tk.BooleanVar(value=str(self.settings.get("upnp")) == "1")
+        ttk.Checkbutton(srv, text="Open the ports on my router automatically (UPnP) - needed for internet play",
+                        variable=self.upnp_var).pack(anchor="w", pady=(6, 0))
+        self._row(srv, "Game folder", "game_dir", browse=self._browse_game)
 
         btns = ttk.Frame(f)
-        btns.pack(fill=tk.X)
+        btns.pack(fill=tk.X, pady=(10, 0))
         self.start_btn = ttk.Button(btns, text="Start server", style="Accent.TButton", command=self._toggle_server)
         self.start_btn.pack(side=tk.LEFT)
-        ttk.Button(btns, text="Save settings only", command=self._apply_settings).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Open log folder", command=self._open_logs).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Join my server", command=self._join_own).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Start LMU", command=self._start_game).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Open server log", command=self._open_log).pack(side=tk.LEFT, padx=6)
 
         self.server_state = tk.Label(f, text="", bg=BG, fg=MUTED, font=("Segoe UI", 10),
-                                     anchor="w", justify=tk.LEFT, wraplength=800)
-        self.server_state.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(f, style="Muted.TLabel", wraplength=800, justify=tk.LEFT, text=(
-            "The game is started through Steam, so your Steam launch options also apply. Steam may ask you to "
-            "confirm the extra arguments the first time. If you put +host in your Steam launch options instead, "
-            "the toolkit detects it and treats the running game as the server.")).pack(fill=tk.X, pady=(6, 0))
-        return f
+                                     anchor="w", justify=tk.LEFT, wraplength=820)
+        self.server_state.pack(fill=tk.X, pady=(10, 4))
 
-    def _live_tab(self, nb):
-        f = ttk.Frame(nb, padding=12)
-        info = ttk.LabelFrame(f, text="Running game", padding=10)
-        info.pack(fill=tk.X)
-        self.live_info = ttk.Label(info, text="", justify=tk.LEFT, font=("Consolas", 10))
-        self.live_info.pack(fill=tk.X)
-        ttk.Button(info, text="Restart game as host", command=self._restart_as_host).pack(anchor="w", pady=(8, 0))
-
-        chat = ttk.LabelFrame(f, text="Chat and admin commands (in a multiplayer session)", padding=10)
-        chat.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
-        self.chat_log = tk.Text(chat, height=10, bg=PANEL, fg=TEXT, font=("Consolas", 10),
-                                relief=tk.FLAT, state=tk.DISABLED, wrap=tk.WORD)
-        self.chat_log.pack(fill=tk.BOTH, expand=True)
-        row = ttk.Frame(chat)
-        row.pack(fill=tk.X, pady=(8, 0))
-        self.chat_entry = tk.StringVar()
-        entry = ttk.Entry(row, textvariable=self.chat_entry)
-        entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        entry.bind("<Return>", lambda _e: self._send_chat())
-        ttk.Button(row, text="Send", command=self._send_chat).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(chat, style="Muted.TLabel", text=(
-            "Admin: /admin <password> to log in, /admin to log out, /apwd <new> to change the admin password."
-        )).pack(anchor="w", pady=(6, 0))
+        out = ttk.LabelFrame(f, text="Server output", padding=6)
+        out.pack(fill=tk.BOTH, expand=True)
+        self.out_text = tk.Text(out, height=10, bg=PANEL, fg=TEXT, font=("Consolas", 9),
+                                relief=tk.FLAT, state=tk.DISABLED, wrap=tk.NONE)
+        self.out_text.pack(fill=tk.BOTH, expand=True)
         return f
 
     def _share_tab(self, nb):
@@ -493,10 +478,13 @@ class App(tk.Tk):
         fw.pack(fill=tk.X, pady=10)
         self.ports_label = ttk.Label(fw, text="", justify=tk.LEFT, font=("Consolas", 10))
         self.ports_label.pack(fill=tk.X)
-        ttk.Label(fw, style="Muted.TLabel", wraplength=800, justify=tk.LEFT, text=(
-            "Same network: open the Windows Firewall rules below and you are done.\n"
-            "Over the internet: also forward the same ports on your router to this PC's LAN IP, "
-            "or use a virtual LAN such as Tailscale or ZeroTier and share that IP instead (no router changes)."
+        ttk.Label(fw, style="Muted.TLabel", wraplength=820, justify=tk.LEFT, text=(
+            "Only the host needs open ports. With the UPnP box ticked the server asks your router to forward "
+            "them while it runs and closes them again when it stops; the server output says whether that "
+            "worked. Without UPnP, forward these ports to this PC's LAN IP by hand, or put everyone on a "
+            "virtual LAN such as Tailscale or ZeroTier and share that IP instead.\n"
+            "Windows Firewall: Windows usually asks the first time the server starts; if nobody can connect, "
+            "add the rules with the button below."
         )).pack(fill=tk.X, pady=(6, 6))
         ttk.Button(fw, text="Add Windows Firewall rules (asks for admin)",
                    command=self._open_firewall).pack(anchor="w")
@@ -505,7 +493,7 @@ class App(tk.Tk):
 
     def _join_tab(self, nb):
         f = ttk.Frame(nb, padding=12)
-        box = ttk.LabelFrame(f, text="Direct connect (LMU must be running)", padding=10)
+        box = ttk.LabelFrame(f, text="Direct connect (LMU must be running, at the main menu)", padding=10)
         box.pack(fill=tk.X)
         self._row(box, "Server IP", "connect_host")
         self._row(box, "HTTP port", "connect_port", width=8)
@@ -515,16 +503,11 @@ class App(tk.Tk):
         ttk.Label(row, text="Password", width=18).pack(side=tk.LEFT)
         ttk.Entry(row, textvariable=self.join_pass, show="*").pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(box, text="Connect", style="Accent.TButton", command=self._join).pack(anchor="w", pady=(8, 0))
-        self.join_state = ttk.Label(box, text="", style="Muted.TLabel")
+        self.join_state = ttk.Label(box, text="", style="Muted.TLabel", wraplength=820, justify=tk.LEFT)
         self.join_state.pack(fill=tk.X, pady=(6, 0))
-
-        alt = ttk.LabelFrame(f, text="Alternative: Steam launch options", padding=10)
-        alt.pack(fill=tk.X, pady=10)
-        ttk.Label(alt, justify=tk.LEFT, text=(
-            "Steam > right-click Le Mans Ultimate > Properties > Launch Options:\n"
-            "    +connect HOST_IP:HTTP_PORT\n"
-            "    +connect HOST_IP:HTTP_PORT +password YOUR_PASSWORD"
-        ), font=("Consolas", 10)).pack(anchor="w")
+        ttk.Label(f, style="Muted.TLabel", wraplength=820, justify=tk.LEFT, text=(
+            "The car you drive is the one last selected in the game's menus; pick it before connecting. "
+            "Everyone needs the same game version as the host.")).pack(fill=tk.X, pady=(10, 0))
         return f
 
     def _lan_tab(self, nb):
@@ -556,224 +539,127 @@ class App(tk.Tk):
 
     def _collect(self):
         s = {k: v.get().strip() for k, v in self.vars.items()}
-        s["max_clients"] = self._int("max_clients", 1, 120)
+        s["max_clients"] = self._int("max_clients", 1, 104)
         s["http_port"] = self._int("http_port", 1025, 65535)
-        s["sim_port"] = self._int("sim_port", 1025, 65535 - s["max_clients"])
+        s["sim_port"] = self._int("sim_port", 1025, 65535)
         s["connect_port"] = self._int("connect_port", 1, 65535)
+        s["upnp"] = "1" if self.upnp_var.get() else "0"
+        if s["http_port"] == s["sim_port"]:
+            raise ValueError("HTTP port and simulation port must differ")
+        if not re.fullmatch(r"\s*[PQWRpqwr]:\d+(\.\d+)?(\s*,\s*[PQWRpqwr]:\d+(\.\d+)?)*\s*", s["sessions"]):
+            raise ValueError("Sessions look like P:30,Q:15,R:30 (letter:minutes)")
         if not (Path(s["game_dir"]) / GAME_EXE).exists():
-            raise ValueError(f"{GAME_EXE} not found in the install folder")
+            raise ValueError(f"{GAME_EXE} not found in the game folder")
         self.settings.update(s)
         save_settings(self.settings)
         return self.settings
-
-    def _mp_values(self, s):
-        values = {
-            "Default Game Name": s["server_name"],
-            "Join Password": s["join_password"],
-            "Max Clients": s["max_clients"],
-            "HTTP Server Port": s["http_port"],
-            "Simulation Port": s["sim_port"],
-        }
-        if s["admin_password"]:
-            values["Admin Password"] = s["admin_password"]
-        return values
-
-    def _apply_settings(self, quiet=False):
-        try:
-            s = self._collect()
-        except ValueError as e:
-            messagebox.showerror("Check settings", str(e))
-            return None
-        path = multiplayer_json_path(s["game_dir"], s["profile"])
-        if not path.exists():
-            self.profile_note.configure(text=(
-                f"No Multiplayer.JSON yet at {path}. Launch LMU once normally so it creates your profile, "
-                "then come back. Settings are saved in the toolkit until then."))
-            if not quiet:
-                messagebox.showwarning("Profile not created yet",
-                                       "Launch Le Mans Ultimate once so it creates its profile files, then try again.")
-            return s
-        try:
-            missing = patch_mp_json(path, self._mp_values(s))
-        except (OSError, ValueError) as e:
-            messagebox.showerror("Could not update Multiplayer.JSON", str(e))
-            return None
-        note = f"Updated {path} (original backed up as Multiplayer.JSON.bak)."
-        if missing:
-            note += f" Not present in this game version: {', '.join(missing)}."
-        self.profile_note.configure(text=note)
-        self._refresh_share()
-        return s
-
-    def _load_from_profile(self, quiet=False):
-        game_dir = self._var("game_dir").get()
-        profiles = find_profiles(game_dir) if game_dir else []
-        self.profile_box["values"] = profiles
-        if profiles and self._var("profile").get() not in profiles:
-            self._var("profile").set(profiles[0])
-        path = multiplayer_json_path(game_dir, self._var("profile").get()) if game_dir else None
-        if not path or not path.exists():
-            self.profile_note.configure(text=(
-                "No Multiplayer.JSON found yet. Launch LMU once normally so it creates "
-                "UserData\\<profile>\\Multiplayer.JSON; until then the rFactor 2 default ports are shown."))
-            return
-        try:
-            v = read_mp_values(path, ["Default Game Name", "Max Clients", "HTTP Server Port", "Simulation Port"])
-        except (OSError, ValueError) as e:
-            if not quiet:
-                messagebox.showerror("Could not read Multiplayer.JSON", str(e))
-            return
-        for json_key, key in (("Default Game Name", "server_name"), ("Max Clients", "max_clients"),
-                              ("HTTP Server Port", "http_port"), ("Simulation Port", "sim_port")):
-            if v.get(json_key) not in (None, ""):
-                self._var(key).set(str(v[json_key]))
-        self.profile_note.configure(text=f"Loaded settings from {path}")
-        self._refresh_share()
 
     def _browse_game(self):
         d = filedialog.askdirectory(title="Select the Le Mans Ultimate install folder")
         if d:
             self._var("game_dir").set(d)
-            self._load_from_profile()
 
     # ---- hosting
 
-    def _hosting(self):
-        snap = self.poller.snapshot
-        return snap.get("running") and snap.get("hosting_args")
+    def _server_args(self, s):
+        args = ["--game-dir", s["game_dir"], "--name", s["server_name"], "--http", str(s["http_port"]),
+                "--sim", str(s["sim_port"]), "--max-players", str(s["max_clients"]),
+                "--scene", s["scene"].upper(), "--sessions", s["sessions"].replace(" ", "")]
+        if s["join_password"]:
+            args += ["--password", s["join_password"]]
+        if s["upnp"] == "1":
+            args.append("--upnp")
+        return args
 
     def _toggle_server(self):
-        if self.busy:
+        if self.stopping_since:
             return
-        snap = self.poller.snapshot
-        if self._hosting():
-            if messagebox.askyesno("Stop server", "Close Le Mans Ultimate to stop the server?"):
-                self._close_then(None)
-        elif snap.get("running"):
-            self._restart_as_host()
-        else:
-            self._launch_host()
-
-    def _restart_as_host(self):
-        if self.busy:
+        if self.server.running():
+            self.server.stop()
+            self.stopping_since = time.time()
             return
-        if not self.poller.snapshot.get("running"):
-            self._launch_host()
-            return
-        if messagebox.askyesno("Restart as host", "Hosting can only be turned on when the game starts.\n\n"
-                                                  "Close Le Mans Ultimate and start it again through Steam as a host?"):
-            self._close_then(self._launch_host)
-
-    def _close_then(self, next_step):
-        self.busy = True
-        self.server_state.configure(text="Closing Le Mans Ultimate...", fg=WARN)
-
-        def work():
-            closed = close_game()
-            self.after(0, lambda: self._after_close(closed, next_step))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _after_close(self, closed, next_step):
-        self.busy = False
-        if not closed:
-            messagebox.showwarning("Game still running", "The game did not close. Close it yourself, then try again.")
-            return
-        if next_step:
-            next_step()
-
-    def _launch_host(self):
-        s = self._apply_settings(quiet=True)
-        if not s:
-            return
-        # No +profile=...: Steam quotes "key=value" args, the game then looks for a profile named `player"` and crashes.
-        args = s["extra_args"].split() + ["+maxplayers", str(s["max_clients"])]
-        if any("=" in a for a in args):
-            if not messagebox.askyesno("Launch arguments", "Arguments containing '=' get quoted by Steam and can "
-                                                           "break the launch (this crashed the game before). Continue?"):
-                return
-        if s["join_password"]:
-            args += ["+password", s["join_password"]]
         try:
-            launch_via_steam(args)
+            s = self._collect()
+        except ValueError as e:
+            messagebox.showerror("Check settings", str(e))
+            return
+        missing = server_data_missing()
+        if missing:
+            messagebox.showerror("Game data missing", (
+                "The server needs the game's rules and Balance of Performance files, extracted from your own "
+                "install (they are not shipped with this tool):\n\n" + "\n".join(missing)))
+            return
+        if s["scene"].upper() not in track_scenes():
+            messagebox.showerror("Track", f"No BoP file for track '{s['scene']}'. Pick one from the list.")
+            return
+        self._clear_output()
+        try:
+            self.server.start(self._server_args(s))
+        except OSError as e:
+            messagebox.showerror("Could not start the server", str(e))
+
+    def _join_own(self):
+        if not self.server.running():
+            messagebox.showinfo("Join my server", "Start the server first.")
+            return
+        self._join("127.0.0.1", self.settings["http_port"], self.settings.get("join_password", ""))
+
+    def _start_game(self):
+        if self.poller.snapshot.get("running"):
+            messagebox.showinfo("Start LMU", "Le Mans Ultimate is already running.")
+            return
+        try:
+            launch_via_steam()
         except OSError as e:
             messagebox.showerror("Could not start through Steam", str(e))
-            return
-        self.launch_requested_at = time.time()
-        shown = ["***" if i and args[i - 1] == "+password" else a for i, a in enumerate(args)]
-        self.server_state.configure(text=f"Asked Steam to start the game with: {' '.join(shown)}", fg=WARN)
 
     def _server_status(self):
-        snap = self.poller.snapshot
-        port = self.settings["http_port"]
-        if self.busy:
-            return "Closing Le Mans Ultimate...", WARN
-        if snap.get("running"):
-            self.launch_requested_at = None
-            if not snap.get("hosting_args"):
-                return ("Game is running but was not started with +host, so it is not hosting. "
-                        "Click Start server to restart it as a host."), MUTED
-            if snap.get("listening"):
-                return f"Hosting - accepting connections on TCP {port}. Friends can join now.", OK
-            return (f"Game started with +host but nothing is listening on TCP {port} yet. Wait for the track "
-                    "to load, or start a session in-game. If it never turns green, check the log folder."), WARN
-        if self.launch_requested_at:
-            waited = int(time.time() - self.launch_requested_at)
-            if waited < LAUNCH_TIMEOUT:
-                return f"Waiting for the game to start through Steam ({waited}s)...", WARN
-            self.launch_requested_at = None
-            return ("The game did not start. Check Steam for a prompt to allow the launch arguments, "
-                    "then try again."), ERR
-        return "Game not running.", MUTED
+        if self.stopping_since:
+            return "Stopping: sending players back to the menu and closing router ports...", WARN
+        if not self.server.running():
+            return "Server not running.", MUTED
+        addr = self.server.join_address
+        if not addr:
+            return "Starting...", WARN
+        return f"Server running. Players join {addr}  (this PC: Join my server).", OK
+
+    def _clear_output(self):
+        self.out_text.configure(state=tk.NORMAL)
+        self.out_text.delete("1.0", tk.END)
+        self.out_text.configure(state=tk.DISABLED)
+
+    def _drain_output(self):
+        lines = []
+        while True:
+            try:
+                lines.append(self.server.lines.get_nowait())
+            except queue.Empty:
+                break
+        if not lines:
+            return
+        self.out_text.configure(state=tk.NORMAL)
+        for line in lines:
+            if line.startswith("    "):  # hex dumps
+                continue
+            self.out_text.insert(tk.END, line + "\n")
+        excess = int(self.out_text.index("end-1c").split(".")[0]) - 2000
+        if excess > 0:
+            self.out_text.delete("1.0", f"{excess}.0")
+        self.out_text.configure(state=tk.DISABLED)
+        self.out_text.see(tk.END)
+        self._refresh_share()
 
     def _broadcast_info(self):
-        snap = self.poller.snapshot
-        if not (snap.get("running") and snap.get("hosting_args") and snap.get("listening")):
+        if not self.server.running() or self.stopping_since:
             return None
         return {"magic": LAN_MAGIC, "name": self.settings["server_name"], "port": self.settings["http_port"],
                 "maxPlayers": self.settings["max_clients"], "password": bool(self.settings["join_password"])}
 
-    def _open_logs(self):
-        logs = Path(self._var("game_dir").get()) / "UserData" / "Log"
-        if logs.exists():
-            os.startfile(logs)
+    def _open_log(self):
+        if SERVER_LOG.exists():
+            os.startfile(SERVER_LOG)
         else:
-            messagebox.showinfo("No logs yet", f"{logs} does not exist yet.")
-
-    # ---- live game
-
-    def _send_chat(self):
-        msg = self.chat_entry.get().strip()
-        if not msg:
-            return
-        try:
-            send_chat(msg)
-            self.chat_entry.set("")
-        except OSError as e:
-            messagebox.showerror("Chat", f"Could not send: {e}")
-
-    def _refresh_live(self, snap):
-        if snap.get("running"):
-            st = snap.get("state") if isinstance(snap.get("state"), dict) else {}
-            state = st.get("gameState", "?") + (f" ({st['reason']})" if st.get("reason") else "")
-            lines = [f"Launched as:   {snap.get('command_line') or '?'}",
-                     f"Hosting:       {'yes (+host)' if snap.get('hosting_args') else 'no'}",
-                     f"Game state:    {state}",
-                     f"Join state:    {snap.get('join_state')}",
-                     f"Anti-cheat:    {'active' if snap.get('eac') else 'not active'}"]
-        else:
-            lines = ["Le Mans Ultimate is not running."]
-        self.live_info.configure(text="\n".join(lines))
-
-        chat = snap.get("chat") or []
-        if chat != self._chat_seen:
-            self._chat_seen = chat
-            self.chat_log.configure(state=tk.NORMAL)
-            self.chat_log.delete("1.0", tk.END)
-            for c in chat:
-                self.chat_log.insert(tk.END, (c.get("message", "") if isinstance(c, dict) else str(c)) + "\n")
-            self.chat_log.configure(state=tk.DISABLED)
-            self.chat_log.see(tk.END)
+            messagebox.showinfo("No log yet", f"{SERVER_LOG} does not exist yet.")
 
     # ---- sharing
 
@@ -781,23 +667,26 @@ class App(tk.Tk):
         try:
             http = int(self._var("http_port").get())
             sim = int(self._var("sim_port").get())
-            mc = int(self._var("max_clients").get())
         except ValueError:
             return
-        ip = lan_ip()
-        lines = [f"Server: {self._var('server_name').get()}",
-                 f"Same network:  +connect {ip}:{http}"]
-        if self._public_ip:
-            lines.append(f"Internet:      +connect {self._public_ip}:{http}")
+        lan = upnp.default_lan_ip()
+        public = None
+        if self.server.join_address and not self.server.join_address.startswith(lan + ":"):
+            public = self.server.join_address.rsplit(":", 1)[0]
+        public = public or self._public_ip
+        lines = [f"Server:   {self._var('server_name').get()}",
+                 f"Same network:  {lan}  port {http}"]
+        if public:
+            lines.append(f"Internet:      {public}  port {http}")
         else:
-            lines.append("Internet:      click 'Look up public IP' (needs port forwarding)")
+            lines.append("Internet:      start the server with UPnP, or click 'Look up public IP'")
         lines.append("Password:      " + ("(ask the host)" if self._var("join_password").get() else "none"))
-        lines.append("Or use the Join tab of this toolkit with the same IP and port.")
+        lines.append("Join with this toolkit's Join tab, or connect-to-server.bat IP PORT [PASSWORD].")
         self.share_text.delete("1.0", tk.END)
         self.share_text.insert(tk.END, "\n".join(lines))
         self.ports_label.configure(text=(
-            f"TCP + UDP {http}            (HTTP port: players connect here)\n"
-            f"TCP + UDP {sim}-{sim + mc}    (simulation port range: port to port + max clients)"))
+            f"TCP {http}        HTTP port: players connect here first\n"
+            f"TCP + UDP {sim}  simulation port: the race itself"))
 
     def _copy_share(self):
         self.clipboard_clear()
@@ -814,7 +703,7 @@ class App(tk.Tk):
     def _open_firewall(self):
         try:
             s = self._collect()
-            rules = open_firewall(s["http_port"], s["sim_port"], s["max_clients"])
+            rules = open_firewall(s["http_port"], s["sim_port"])
         except ValueError as e:
             messagebox.showerror("Check settings", str(e))
             return
@@ -825,24 +714,26 @@ class App(tk.Tk):
 
     # ---- joining
 
-    def _join(self, host=None, port=None):
+    def _join(self, host=None, port=None, password=None):
         host = host or self._var("connect_host").get().strip()
         port = port or self._var("connect_port").get().strip()
+        password = self.join_pass.get() if password is None else password
         if not host or not port:
             self.join_state.configure(text="Enter the server IP and port.")
             return
-        if not game_running():
-            self.join_state.configure(text="LMU is not running. Start the game, then connect.")
+        if not self.poller.snapshot.get("running") and not game_running():
+            msg = "LMU is not running. Start the game, wait for the main menu, then connect."
+            self.join_state.configure(text=msg)
+            self.server_state.configure(text=msg, fg=WARN)
             return
         try:
             self._collect()
         except ValueError:
             pass
-        try:
-            code, _ = join_server(host, port, self.join_pass.get())
-            self.join_state.configure(text=f"Join request sent to {host}:{port} (HTTP {code}). Switch to the game.")
-        except OSError as e:
-            self.join_state.configure(text=f"Join failed: {e}")
+        self.join_state.configure(text=f"Joining {host}:{port}...")
+        threading.Thread(target=join_and_enter, args=(host, port, password,
+                                                      lambda text, final: self.join_msgs.put(text)),
+                         daemon=True).start()
 
     def _join_selected(self):
         sel = self.tree.selection()
@@ -858,13 +749,25 @@ class App(tk.Tk):
     def _tick(self):
         snap = self.poller.snapshot
         if snap.get("running"):
-            self.status.configure(text="LMU running" + (" as host" if snap.get("hosting_args") else ""), fg=OK)
+            st = snap.get("state") if isinstance(snap.get("state"), dict) else {}
+            self.status.configure(text=f"LMU running ({st.get('gameState', '?')}, {snap.get('join_state')})", fg=OK)
         else:
             self.status.configure(text="LMU not running", fg=MUTED)
+
+        self._drain_output()
+        if self.stopping_since and (not self.server.running() or time.time() - self.stopping_since > 30):
+            if self.server.running():
+                self.server.proc.kill()
+            self.stopping_since = None
         text, color = self._server_status()
         self.server_state.configure(text=text, fg=color)
-        self.start_btn.configure(text="Stop server" if self._hosting() else "Start server")
-        self._refresh_live(snap)
+        self.start_btn.configure(text="Stop server" if self.server.running() else "Start server")
+
+        while True:
+            try:
+                self.join_state.configure(text=self.join_msgs.get_nowait())
+            except queue.Empty:
+                break
 
         selected = {self.tree.item(i, "values")[1:3] for i in self.tree.selection()}
         self.tree.delete(*self.tree.get_children())
@@ -874,17 +777,45 @@ class App(tk.Tk):
             item = self.tree.insert("", tk.END, values=values)
             if (str(values[1]), str(values[2])) in selected:
                 self.tree.selection_add(item)
-        self.after(2000, self._tick)
+        self.after(1000, self._tick)
 
     def _on_close(self):
         try:
             self._collect()
         except ValueError:
             pass
+        if self.server.running():
+            if not messagebox.askyesno("Quit", "Stop the server and quit?"):
+                return
+            self.server.stop()
+            self.server_state.configure(text="Stopping the server, the window closes when it is done...", fg=WARN)
+            self._close_when_stopped(time.time())
+            return
+        self._shutdown()
+
+    def _close_when_stopped(self, since):
+        if self.server.running() and time.time() - since < 30:
+            self._drain_output()
+            self.after(500, lambda: self._close_when_stopped(since))
+            return
+        if self.server.running():
+            self.server.proc.kill()
+        self._shutdown()
+
+    def _shutdown(self):
         for t in (self.poller, self.listener, self.broadcaster):
             t.stop_event.set()
         self.destroy()
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    if len(sys.argv) > 2 and sys.argv[1] == "--join":
+        # command-line join, used by connect-to-server.bat: --join HOST [PORT] [PASSWORD]
+        host = sys.argv[2]
+        port = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_HTTP_PORT
+        password = sys.argv[4] if len(sys.argv) > 4 else ""
+        if not game_running():
+            sys.exit("Le Mans Ultimate is not running. Start the game, wait for the main menu, then try again.")
+        join_and_enter(host, port, password, lambda text, final: print(text, flush=True))
+    else:
+        App().mainloop()

@@ -3,3 +3,4 @@ data/
 *.log
 __pycache__/
 *.pyc
+upnp_gateway.txt
