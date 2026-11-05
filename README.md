@@ -8,7 +8,9 @@ Not affiliated with or endorsed by Motorsport Games, Studio 397 or RaceControl. 
 
 ## Features
 
-- **Host**: edits your profile's `Multiplayer.JSON` (server name, passwords, max clients, ports) and launches the game with hosting arguments. It also shows whether the server is actually accepting connections.
+- **Host**: edits your profile's `Multiplayer.JSON` (server name, passwords, max clients, ports) and starts the game **through Steam** (`steam.exe -applaunch 2399420 ...`) with hosting arguments, so Steam, anti-cheat and your own Steam launch options all apply. It also shows whether the server is actually accepting connections.
+- **Attaches to an already-running game**: reads the game's launch arguments, state and anti-cheat status from its local API. If the game was started with `+host` (for example from your Steam launch options), the toolkit treats it as the server, whoever launched it. Hosting can only be turned on at startup, so **Restart game as host** closes the game cleanly and relaunches it through Steam.
+- **Live Game**: chat window and send box for the running game, so you can use admin commands such as `/admin <password>`.
 - **Share / Ports**: generates the connect line for friends, looks up your public IP on request, and adds Windows Firewall rules in one click.
 - **Join**: tells a running LMU to connect to `IP:port` through its local REST API (`127.0.0.1:6397`).
 - **LAN Browser**: toolkit instances announce running servers to each other on the local network.
@@ -23,7 +25,7 @@ Not affiliated with or endorsed by Motorsport Games, Studio 397 or RaceControl. 
 
 1. Launch LMU once normally so it creates `UserData\<profile>\Multiplayer.JSON`.
 2. Run `start-server.bat` (or `python lmu_server_toolkit.py`).
-3. **Host tab**: set the name, passwords and ports, then click **Start server**. The status line turns green when the server is accepting connections on the HTTP port.
+3. **Host tab**: set the name, passwords and ports, then click **Start server**. If the game is already open, the toolkit asks before closing it and restarting it as a host. Steam may ask you to confirm the launch arguments the first time. The status line turns green when the server is accepting connections on the HTTP port.
 4. **Share / Ports tab**: click **Add Windows Firewall rules**, then send friends the text shown.
 5. Friends start LMU and use the **Join** tab, `connect-to-server.bat HOST PORT [PASSWORD]`, or the Steam launch option `+connect HOST:PORT`.
 
@@ -57,8 +59,16 @@ The game UI talks to a local REST API on port 6397. The multiplayer endpoints us
 | `GET /rest/multiplayer/join?host=&port=&password=&authentication=` | Join a server |
 | `GET /rest/multiplayer/join/state` | Join progress |
 | `GET /rest/multiplayer/steam/status` | Used to check the game is running |
+| `GET /rest/options/commandline` | Launch arguments (used to detect `+host`) |
+| `GET /rest/sessions/GetGameState` | Current state, e.g. `Setup` at the menu |
+| `GET /rest/profile/eacActive` | Whether anti-cheat is active |
+| `GET` / `POST /rest/chat/` | Read chat / send a chat line (plain text body) |
 
-Launch arguments to experiment with go in the **Launch arguments** field on the Host tab (default `+host`).
+The full list of 183 endpoints is published by the game itself at `http://127.0.0.1:6397/swagger-schema.json` while it runs. None of them starts hosting, which is why hosting needs a restart with `+host`.
+
+Launch arguments to experiment with go in the **Launch arguments** field on the Host tab (default `+host`). The game's log confirms `+host` is recognised: it prints `NetComm activated autohost mode`.
+
+**Avoid `key=value` arguments such as `+profile=player`.** When the game is launched through Steam, Steam wraps them in quotes. The game then looks for a profile literally named `player"`, fails with `Could not find player profile and failed to create one! FATAL`, and crashes. The toolkit therefore always uses the game's default profile. Launching the executable directly instead of through Steam doesn't work either: Steam isn't initialised and the game exits with fatal error 11.
 
 ## Files
 
